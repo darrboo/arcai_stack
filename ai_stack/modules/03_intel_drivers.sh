@@ -5,129 +5,169 @@
 #  Depends on: lib/common.sh
 # ================================================================
 
-# ── Repo setup helpers ───────────────────────────────────────────
+#!/usr/bin/env bash
+# Intel Arc 2026 Smart Installer — resilient, interactive, resumable
+# Supports: Ubuntu 22.04/24.04
 
-_add_intel_gpu_repo() {
-    if [[ -f /etc/apt/sources.list.d/intel-gpu.list ]]; then
-        INFO "Intel GPU repo already configured."
-        return
-    fi
-    INFO "Adding Intel GPU package repository…"
-    # Key is fetched over HTTPS from Intel's official domain
-    wget -qO - https://repositories.intel.com/gpu/intel-graphics.key \
-        | sudo gpg --yes --dearmor \
-            -o /usr/share/keyrings/intel-graphics.gpg
-    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] \
-https://repositories.intel.com/gpu/ubuntu noble unified" \
-        | sudo tee /etc/apt/sources.list.d/intel-gpu.list
-    sudo apt-get update -qq || true
+set -Eeuo pipefail
+
+STATE_FILE="/var/tmp/intel_arc_install.state"
+LOG_FILE="/var/tmp/intel_arc_install.log"
+
+# ---------- logging ----------
+log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
+err(){ log "ERROR: $*"; }
+ok(){ log "OK: $*"; }
+warn(){ log "WARN: $*"; }
+
+# ---------- state ----------
+save_state(){ echo "$1" > "$STATE_FILE"; }
+load_state(){ [[ -f "$STATE_FILE" ]] && cat "$STATE_FILE" || echo ""; }
+
+# ---------- detection ----------
+detect(){
+  KERNEL=$(uname -r)
+  UBUNTU=$(lsb_release -rs 2>/dev/null || echo unknown)
+  GPU=$(lspci | grep -i 'intel.*vga' || true)
+  DRIVER=$(lsmod | grep -E 'i915|xe' | awk '{print $1}' | head -1)
 }
 
-_add_oneapi_repo() {
-    if [[ -f /etc/apt/sources.list.d/oneAPI.list ]]; then
-        INFO "oneAPI repo already configured."
-        return
-    fi
-    INFO "Adding Intel oneAPI repository…"
-    wget -qO - https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
-        | sudo gpg --yes --dearmor \
-            -o /usr/share/keyrings/oneapi-archive-keyring.gpg
-    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] \
-https://apt.repos.intel.com/oneapi all main" \
-        | sudo tee /etc/apt/sources.list.d/oneAPI.list
-    sudo apt-get update -qq || true
+# ---------- diagnostics ----------
+diagnose(){
+  detect
+  echo "\n=== SYSTEM ==="
+  echo "Kernel: $KERNEL"
+  echo "Ubuntu: $UBUNTU"
+  echo "GPU: ${GPU:-not detected}"
+  echo "Driver: ${DRIVER:-none}"
+
+  echo "\n=== RUNTIME ==="
+  clinfo -l 2>/dev/null | grep -i intel || echo "OpenCL: FAIL"
+  sycl-ls 2>/dev/null | grep -i gpu || echo "SYCL: FAIL"
+  vainfo 2>/dev/null | grep -i intel || echo "VAAPI: FAIL"
+  vulkaninfo 2>/dev/null | grep -i intel || echo "Vulkan: FAIL"
+  xpu-smi discovery 2>/dev/null || echo "xpu-smi: FAIL"
 }
 
-# ── Driver packages ──────────────────────────────────────────────
-
-_install_gpu_driver_packages() {
-    INFO "Checking Intel GPU driver packages…"
-    local PKGS=()
-
-    if ! dpkg -l intel-opencl-icd 2>/dev/null | grep -q '^ii'; then
-        PKGS+=("intel-opencl-icd")
-    else
-        INFO "  intel-opencl-icd     ✓ already installed"
-    fi
-
-    if dpkg -l libze-intel-gpu1 2>/dev/null | grep -q '^ii' \
-    || dpkg -l intel-level-zero-gpu 2>/dev/null | grep -q '^ii'; then
-        INFO "  level-zero GPU shim  ✓ already installed"
-    else
-        PKGS+=("libze-intel-gpu1")
-    fi
-
-    if ! dpkg -l libze1 2>/dev/null | grep -q '^ii'; then
-        PKGS+=("libze1")
-    else
-        INFO "  libze1               ✓ already installed"
-    fi
-
-    if [[ ${#PKGS[@]} -gt 0 ]]; then
-        INFO "  Installing: ${PKGS[*]}"
-        sudo apt-get install -y "${PKGS[@]}" || true
-    fi
-
-    sudo apt-get install -y --no-install-recommends clinfo libze-dev 2>/dev/null || true
-    OK "Intel GPU driver packages ready."
+# ---------- fixes ----------
+fix_kernel(){
+  log "Ensuring HWE kernel"
+  sudo apt-get install -y linux-generic-hwe-24.04
 }
 
-# ── oneAPI compiler ──────────────────────────────────────────────
+fix_graphics(){
+  log "Installing graphics stack"
+  sudo apt-get install -y \
+    mesa-vulkan-drivers \
+    mesa-opencl-icd \
+    intel-media-va-driver-non-free \
+    vainfo libvpl2 intel-gsc xpu-smi
+}
 
-_install_oneapi_compiler() {
-    INFO "Checking Intel oneAPI compiler…"
+fix_compute(){
+  log "Installing compute runtime"
+  sudo apt-get install -y intel-opencl-icd intel-level-zero-gpu libze1 libze-dev clinfo
+}
 
-    local ICX_BIN=""
-    ICX_BIN=$(command -v icx 2>/dev/null) \
-        || ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
-        || true
+fix_oneapi(){
+  if ! command -v icx >/dev/null; then
+    log "Installing oneAPI compiler"
+    sudo apt-get install -y intel-oneapi-compiler-dpcpp-cpp || true
+  else
+    ok "icx already present"
+  fi
+}
 
-    if [[ -n "$ICX_BIN" ]]; then
-        OK "Intel icx compiler found: $ICX_BIN"
-        return
+fix_permissions(){
+  sudo usermod -aG render,video "$USER" || true
+  warn "Re-login required for GPU access"
+}
+
+# ---------- intelligent repair ----------
+repair_loop(){
+  for i in {1..3}; do
+    log "Repair pass $i"
+
+    clinfo >/dev/null 2>&1 || fix_compute
+    sycl-ls >/dev/null 2>&1 || fix_oneapi
+    vainfo >/dev/null 2>&1 || fix_graphics
+
+    if clinfo >/dev/null 2>&1 && sycl-ls >/dev/null 2>&1; then
+      ok "Core compute stack working"
+      return
     fi
+  done
 
-    INFO "Installing Intel oneAPI compiler (intel-oneapi-compiler-dpcpp-cpp)…"
-    _add_oneapi_repo
-    sudo apt-get install -y intel-oneapi-compiler-dpcpp-cpp
-
-    ICX_BIN=$(command -v icx 2>/dev/null) \
-        || ICX_BIN=$(find /opt/intel/oneapi -name icx -type f 2>/dev/null | head -1) \
-        || true
-
-    [[ -n "$ICX_BIN" ]] \
-        && OK "icx installed: $ICX_BIN" \
-        || ERR "icx still not found after install — check apt output above."
+  err "Unable to fully repair automatically"
 }
 
-# ── Verify ───────────────────────────────────────────────────────
-
-_verify_gpu_visibility() {
-    INFO "GPU visibility check:"
-
-    echo -e "  OpenCL (clinfo):"
-    clinfo -l 2>/dev/null | grep -i "intel\|Arc" \
-        || WARN "  No Intel GPU detected via OpenCL"
-
-    echo -e "  level-zero backend:"
-    if dpkg -l libze-intel-gpu1 2>/dev/null | grep -q '^ii'; then
-        OK "  libze-intel-gpu1 installed — SYCL will see the GPU after re-login"
-    else
-        WARN "  libze-intel-gpu1 NOT installed — SYCL will not find the GPU!"
-    fi
+# ---------- install modes ----------
+install_stable(){
+  save_state "stable"
+  fix_kernel
+  fix_graphics
+  fix_compute
+  fix_oneapi
+  fix_permissions
+  repair_loop
 }
 
-# ── Public entry point ───────────────────────────────────────────
-
-install_intel_gpu_drivers() {
-    STEP "2/7  Intel Arc A770 GPU drivers"
-
-    _add_intel_gpu_repo
-    _install_gpu_driver_packages
-    _install_oneapi_compiler
-
-    sudo usermod -aG render,video "$USER" 2>/dev/null || true
-    OK "User added to render/video groups (re-login required)."
-
-    _verify_gpu_visibility
+install_performance(){
+  save_state "performance"
+  fix_kernel
+  fix_graphics
+  fix_compute
+  fix_oneapi
+  repair_loop
 }
+
+install_bleeding(){
+  save_state "bleeding"
+  log "Enabling experimental stack"
+  sudo add-apt-repository -y ppa:kobuk-team/intel-graphics || true
+  sudo apt-get update
+  install_performance
+}
+
+# ---------- resume ----------
+resume(){
+  state=$(load_state)
+  [[ -z "$state" ]] && { warn "No previous state"; return; }
+  log "Resuming from $state"
+  case $state in
+    stable) install_stable ;;
+    performance) install_performance ;;
+    bleeding) install_bleeding ;;
+  esac
+}
+
+# ---------- menu ----------
+menu(){
+  PS3="Select option: "
+  select opt in \
+    "Smart Install (auto)" \
+    "Stable" \
+    "Performance" \
+    "Bleeding Edge" \
+    "Diagnose" \
+    "Repair" \
+    "Resume" \
+    "Exit"; do
+
+    case $REPLY in
+      1) install_stable ;;
+      2) install_stable ;;
+      3) install_performance ;;
+      4) install_bleeding ;;
+      5) diagnose ;;
+      6) repair_loop ;;
+      7) resume ;;
+      8) break ;;
+      *) echo "Invalid" ;;
+    esac
+  done
+}
+
+# ---------- entry ----------
+detect
+menu
